@@ -12,5 +12,6 @@ func Setup(app *fiber.App) {
 	app.Post("/api/login", controllers.Login)
 	app.Get("/api/user", controllers.User)
 	app.Get("/api/logout", controllers.Logout)
+	app.Get("/api/refresh", controllers.Refresh)
 
 }

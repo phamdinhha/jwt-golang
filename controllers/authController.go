@@ -199,7 +199,7 @@ func GetAccessTokenFromCookies(c *fiber.Ctx) (*jwt.Token, error) {
 
 func User(c *fiber.Ctx) error {
 
-	token, err := GetAccessTokenFromCookies(c, "jwt")
+	token, err := GetAccessTokenFromCookies(c)
 
 	if err != nil {
 		c.Status(fiber.StatusUnauthorized)
@@ -210,7 +210,10 @@ func User(c *fiber.Ctx) error {
 
 	claims, _ := token.Claims.(jwt.MapClaims)
 
-	userid, err := GetAuth(claims["access_uuid"].(string), claims["user_id"].(uint64))
+	user_ID := claims["user_id"]
+	fmt.Print(user_ID)
+
+	userid, err := GetAuth(claims["access_uuid"].(string), uint64(claims["user_id"].(float64)))
 
 	if err != nil {
 		c.Status(fiber.StatusUnauthorized)
@@ -253,7 +256,7 @@ func Logout(c *fiber.Ctx) error {
 	token, err := GetAccessTokenFromCookies(c)
 	claims, _ := token.Claims.(jwt.MapClaims)
 
-	delErr := DeleteToken(claims["access_uuid"].(string), claims["user_id"].(uint64))
+	delErr := DeleteToken(claims["access_uuid"].(string), uint64(claims["user_id"].(float64)))
 	if delErr != nil {
 		c.Status(fiber.StatusInternalServerError)
 		return c.JSON(fiber.Map{
@@ -295,13 +298,13 @@ func Refresh(c *fiber.Ctx) error {
 	cookie := c.Cookies("jwt-refresh")
 
 	token, err := jwt.ParseWithClaims(cookie, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return []byte(ACCESS_SECRET), nil
+		return []byte(REFRESH_SECRET), nil
 	})
 
 	if err != nil {
 		c.Status(fiber.StatusUnauthorized)
 		return c.JSON(fiber.Map{
-			"message": "unauthorized",
+			"message": err.Error(),
 		})
 	}
 
@@ -328,9 +331,49 @@ func Refresh(c *fiber.Ctx) error {
 		//create new pair of token
 		ts, createErr := CreateToken(user_id)
 		if createErr != nil {
-
+			c.Status(fiber.StatusInternalServerError)
+			return c.JSON(fiber.Map{
+				"message": createErr.Error(),
+			})
 		}
+
+		//cookie to store access token
+		cookie := fiber.Cookie{
+			Name:     "jwt",
+			Value:    ts.AccessToken,
+			Expires:  time.Unix(ts.AtExpires, 0),
+			HTTPOnly: true,
+		}
+
+		//cookie to store refresh token
+		cookie_refresh := fiber.Cookie{
+			Name:     "jwt_refresh",
+			Value:    ts.RefreshToken,
+			Expires:  time.Unix(ts.RtExpires, 0),
+			HTTPOnly: true,
+		}
+
+		c.Cookie(&cookie)
+		c.Cookie(&cookie_refresh)
+
+		saveErr := CreateAuth(int64(user_id), ts)
+
+		if saveErr != nil {
+			c.JSON(fiber.StatusInternalServerError)
+			return c.JSON(fiber.Map{
+				"message": saveErr.Error(),
+			})
+		}
+
+	} else {
+
+		c.JSON(fiber.StatusUnauthorized)
+		return c.JSON(fiber.Map{
+			"message": "unauthorized",
+		})
+
 	}
+	return nil
 }
 
 func DeleteAuth(target_uuid string) (int64, error) {
