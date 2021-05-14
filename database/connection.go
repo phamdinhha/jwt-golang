@@ -11,6 +11,8 @@ import (
 
 var DB *gorm.DB
 
+var RDB *redis.Client
+
 func Connect() {
 
 	dsn := "hapham:Haphamd@95@/golang_jwt"
@@ -23,11 +25,11 @@ func Connect() {
 
 }
 
-func NewRedisDB(host, port, password string) *redis.Client {
+func NewRedisDB(host, port, password string) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     host + ":" + port,
 		Password: password, // no password
 		DB:       0,        // use default db
 	})
-	return client
+	RDB = client
 }

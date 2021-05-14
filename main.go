@@ -18,7 +18,7 @@ func main() {
 	redis_host := "localhost"
 	redis_port := "6379"
 	redis_pass := ""
-	client := database.NewRedisDB(redis_host, redis_port, redis_pass)
+	database.NewRedisDB(redis_host, redis_port, redis_pass)
 
 	app := fiber.New()
 	app.Use(cors.New(cors.Config{

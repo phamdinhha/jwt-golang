@@ -1,17 +1,21 @@
 package controllers
 
 import (
+	"context"
+	"errors"
 	"example/jwt/database"
 	"example/jwt/models"
+	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gofiber/fiber/v2"
-	"github.com/satori/go.uuid"
+	uuid "github.com/satori/go.uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
+//should be env variable
 const ACCESS_SECRET = "access_secret"
 const REFRESH_SECRET = "refresh_secret"
 
@@ -26,7 +30,7 @@ func CreateToken(userid uint64) (*models.TokenDetails, error) {
 	td.AtExpires = time.Now().Add(time.Hour * 24).Unix()
 	td.AccessUuid = uuid.NewV4().String()
 	td.RtExpires = time.Now().Add(time.Hour * 24 * 7).Unix()
-	td.RefreshToken = uuid.NewV4().String()
+	td.RefreshUuid = td.AccessUuid + "++" + strconv.Itoa(int(userid))
 
 	var err error
 	// access token
@@ -52,6 +56,24 @@ func CreateToken(userid uint64) (*models.TokenDetails, error) {
 		return nil, err
 	}
 	return td, nil
+}
+
+func CreateAuth(userid int64, td *models.TokenDetails) error {
+	at := time.Unix(td.AtExpires, 0)
+	rt := time.Unix(td.RtExpires, 0)
+	now := time.Now()
+	ctx := context.TODO()
+
+	errAccess := database.RDB.Set(ctx, td.AccessUuid, strconv.Itoa(int(userid)), at.Sub(now)).Err()
+	if errAccess != nil {
+		return errAccess
+	}
+
+	errRefresh := database.RDB.Set(ctx, td.RefreshUuid, strconv.Itoa(int(userid)), rt.Sub(now)).Err()
+	if errRefresh != nil {
+		return errRefresh
+	}
+	return nil
 }
 
 func Register(c *fiber.Ctx) error {
@@ -95,38 +117,184 @@ func Login(c *fiber.Ctx) error {
 		})
 	}
 
-	clams := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
-		Issuer:    strconv.Itoa(int(user.Id)),
-		ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
-	})
+	// clams := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
+	// 	Issuer:    strconv.Itoa(int(user.Id)),
+	// 	ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
+	// })
 
-	token, err := clams.SignedString([]byte(ACCESS_SECRET))
+	// token, err := clams.SignedString([]byte(ACCESS_SECRET))
+
+	ts, err := CreateToken(uint64(user.Id))
 
 	if err != nil {
 		c.Status(fiber.StatusInternalServerError)
 		return c.JSON(fiber.Map{
-			"message": "could not login",
+			"message": err.Error(),
+		})
+	}
+
+	saveErr := CreateAuth(int64(user.Id), ts)
+
+	if saveErr != nil {
+		c.Status(fiber.StatusInternalServerError)
+		return c.JSON(fiber.Map{
+			"message": saveErr.Error(),
+		})
+	}
+
+	//cookie to store access token
+	cookie := fiber.Cookie{
+		Name:     "jwt",
+		Value:    ts.AccessToken,
+		Expires:  time.Unix(ts.AtExpires, 0),
+		HTTPOnly: true,
+	}
+
+	//cookie to store refresh token
+	cookie_refresh := fiber.Cookie{
+		Name:     "jwt_refresh",
+		Value:    ts.RefreshToken,
+		Expires:  time.Unix(ts.RtExpires, 0),
+		HTTPOnly: true,
+	}
+
+	c.Cookie(&cookie)
+	c.Cookie(&cookie_refresh)
+
+	// tokens := fiber.Map{
+	// 	"access_token":  ts.AccessToken,
+	// 	"refresh_token": ts.RefreshToken,
+	// }
+
+	return c.JSON(fiber.Map{
+		"message": "successfully login!",
+	})
+}
+
+func GetAuth(access_uuid string, userId uint64) (uint64, error) {
+	ctx := context.TODO()
+	userid, err := database.RDB.Get(ctx, access_uuid).Result()
+
+	if err != nil {
+		return 0, err
+	}
+
+	userIdFromDB, _ := strconv.ParseUint(userid, 10, 64)
+	if userId != userIdFromDB {
+		return 0, errors.New("unauthorized")
+	}
+
+	return userIdFromDB, nil
+}
+
+func GetAccessTokenFromCookies(c *fiber.Ctx) (*jwt.Token, error) {
+	cookie := c.Cookies("jwt")
+
+	token, err := jwt.ParseWithClaims(cookie, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(ACCESS_SECRET), nil
+	})
+
+	return token, err
+}
+
+func User(c *fiber.Ctx) error {
+
+	token, err := GetAccessTokenFromCookies(c, "jwt")
+
+	if err != nil {
+		c.Status(fiber.StatusUnauthorized)
+		return c.JSON(fiber.Map{
+			"message": "unauthorized",
+		})
+	}
+
+	claims, _ := token.Claims.(jwt.MapClaims)
+
+	userid, err := GetAuth(claims["access_uuid"].(string), claims["user_id"].(uint64))
+
+	if err != nil {
+		c.Status(fiber.StatusUnauthorized)
+		return c.JSON(fiber.Map{
+			"message": "unauthorized",
+		})
+	}
+
+	var user models.User
+
+	database.DB.Where("id = ?", userid).First(&user)
+
+	return c.JSON(user)
+}
+
+//Delete token from redis db
+func DeleteToken(access_uuid string, userId uint64) error {
+	ctx := context.TODO()
+	refreshUuid := fmt.Sprintf("%s++%d", access_uuid, userId)
+
+	deletedAt, err := database.RDB.Del(ctx, access_uuid).Result()
+	if err != nil {
+		return err
+	}
+
+	deletedRt, err := database.RDB.Del(ctx, refreshUuid).Result()
+	if err != nil {
+		return err
+	}
+
+	if deletedAt != 1 || deletedRt != 1 {
+		return errors.New("something went wrong")
+	}
+
+	return nil
+}
+
+func Logout(c *fiber.Ctx) error {
+
+	token, err := GetAccessTokenFromCookies(c)
+	claims, _ := token.Claims.(jwt.MapClaims)
+
+	delErr := DeleteToken(claims["access_uuid"].(string), claims["user_id"].(uint64))
+	if delErr != nil {
+		c.Status(fiber.StatusInternalServerError)
+		return c.JSON(fiber.Map{
+			"message": delErr.Error(),
+		})
+	}
+
+	if err != nil {
+		c.Status(fiber.StatusUnauthorized)
+		return c.JSON(fiber.Map{
+			"message": "unauthorized",
 		})
 	}
 
 	cookie := fiber.Cookie{
 		Name:     "jwt",
-		Value:    token,
-		Expires:  time.Now().Add(time.Hour * 24),
+		Value:    "",
+		Expires:  time.Now().Add(-time.Hour),
+		HTTPOnly: true,
+	}
+
+	cookie_refresh := fiber.Cookie{
+		Name:     "jwt_refresh",
+		Value:    "",
+		Expires:  time.Now().Add(-time.Hour),
 		HTTPOnly: true,
 	}
 
 	c.Cookie(&cookie)
+	c.Cookie(&cookie_refresh)
 
 	return c.JSON(fiber.Map{
-		"message": "success",
+		"message": "Successfully logged out.",
 	})
 }
 
-func User(c *fiber.Ctx) error {
-	cookie := c.Cookies("jwt")
+//Refresh access token
+func Refresh(c *fiber.Ctx) error {
+	cookie := c.Cookies("jwt-refresh")
 
-	token, err := jwt.ParseWithClaims(cookie, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
+	token, err := jwt.ParseWithClaims(cookie, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return []byte(ACCESS_SECRET), nil
 	})
 
@@ -137,26 +305,39 @@ func User(c *fiber.Ctx) error {
 		})
 	}
 
-	claims := token.Claims.(*jwt.StandardClaims)
-
-	var user models.User
-
-	database.DB.Where("id = ?", claims.Issuer).First(&user)
-
-	return c.JSON(user)
-}
-
-func Logout(c *fiber.Ctx) error {
-	cookie := fiber.Cookie{
-		Name:     "jwt",
-		Value:    "",
-		Expires:  time.Now().Add(-time.Hour),
-		HTTPOnly: true,
+	if _, ok := token.Claims.(jwt.Claims); !ok && !token.Valid {
+		c.Status(fiber.StatusUnauthorized)
+		return c.JSON(fiber.Map{
+			"message": "unauthorized",
+		})
 	}
 
-	c.Cookie(&cookie)
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if ok && token.Valid {
+		refreshUuid := claims["refresh_uuid"].(string)
+		user_id := claims["user_id"].(uint64)
 
-	return c.JSON(fiber.Map{
-		"message": "success",
-	})
+		deleted, delErr := DeleteAuth(refreshUuid)
+		if delErr != nil || deleted == 0 {
+			c.Status(fiber.StatusUnauthorized)
+			return c.JSON(fiber.Map{
+				"message": "unauthorized",
+			})
+		}
+
+		//create new pair of token
+		ts, createErr := CreateToken(user_id)
+		if createErr != nil {
+
+		}
+	}
+}
+
+func DeleteAuth(target_uuid string) (int64, error) {
+	ctx := context.TODO()
+	deleted, err := database.RDB.Del(ctx, target_uuid).Result()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
